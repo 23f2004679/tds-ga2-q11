@@ -14,7 +14,8 @@
       "headers": {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key, X-Client-Id"
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key, X-Client-Id",
+        "Retry-After": "10"
       }
     }
   ]
