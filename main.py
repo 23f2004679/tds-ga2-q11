@@ -23,6 +23,7 @@ app.add_middleware(
         "Idempotency-Key",
         "X-Client-Id",
     ],
+    expose_headers=["Retry-After"],
 )
 
 catalog = [
