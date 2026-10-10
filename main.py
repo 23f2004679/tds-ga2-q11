@@ -65,11 +65,14 @@ async def per_client_rate_limit(request: Request, call_next):
                 int(WINDOW_SECONDS - (now - timestamps[0]) + 0.999),
             )
 
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=429,
                 content={"detail": "Rate limit exceeded"},
-                headers={"Retry-After": str(retry_after)},
             )
+            response.headers["Retry-After"] = str(retry_after)
+            response.headers["Access-Control-Allow-Origin"] = "*"
+
+            return response
 
         timestamps.append(now)
 
