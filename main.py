@@ -16,58 +16,70 @@ WINDOW_SECONDS = 10
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "Idempotency-Key",
+        "X-Client-Id",
+    ],
 )
 
-# Fixed catalogue used by cursor pagination: IDs 1 through 54.
 catalog = [
     {"id": i, "product": f"Product {i}", "quantity": 1}
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
-# In-memory idempotency store.
 idempotency_keys: dict[str, dict[str, Any]] = {}
 next_order_id = 1
 order_lock = Lock()
 
-# Independent sliding-window rate-limit bucket per client.
 client_requests = defaultdict(deque)
 rate_limit_lock = Lock()
 
 
 @app.middleware("http")
 async def per_client_rate_limit(request: Request, call_next):
-    # CORS preflight requests should not consume the client's quota.
     if request.method == "OPTIONS":
         return await call_next(request)
 
     client_id = request.headers.get("X-Client-Id")
 
-    if client_id:
-        now = monotonic()
+    if not client_id:
+        response = await call_next(request)
+        if response.status_code == 429 and "Retry-After" not in response.headers:
+            response.headers["Retry-After"] = str(WINDOW_SECONDS)
+        return response
 
-        with rate_limit_lock:
-            timestamps = client_requests[client_id]
+    now = monotonic()
 
-            while timestamps and now - timestamps[0] >= WINDOW_SECONDS:
-                timestamps.popleft()
+    with rate_limit_lock:
+        timestamps = client_requests[client_id]
 
-            if len(timestamps) >= RATE_LIMIT:
-                retry_after = max(
-                    1,
-                    int(WINDOW_SECONDS - (now - timestamps[0]) + 0.999),
-                )
+        while timestamps and now - timestamps[0] >= WINDOW_SECONDS:
+            timestamps.popleft()
 
-                return JSONResponse(
-                    status_code=429,
-                    content={"detail": "Rate limit exceeded"},
-                    headers={"Retry-After": str(retry_after)},
-                )
+        if len(timestamps) >= RATE_LIMIT:
+            retry_after = max(
+                1,
+                int(WINDOW_SECONDS - (now - timestamps[0]) + 0.999),
+            )
 
-            timestamps.append(now)
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded"},
+                headers={"Retry-After": str(retry_after)},
+            )
 
-    return await call_next(request)
+        timestamps.append(now)
+
+    response = await call_next(request)
+
+    # Ensure every HTTP 429 response includes Retry-After.
+    if response.status_code == 429 and "Retry-After" not in response.headers:
+        response.headers["Retry-After"] = str(WINDOW_SECONDS)
+
+    return response
 
 
 @app.get("/")
@@ -89,7 +101,6 @@ def create_order(
         )
 
     with order_lock:
-        # Reuse the original result for repeated keys.
         if idempotency_key in idempotency_keys:
             return idempotency_keys[idempotency_key]
 
@@ -120,17 +131,11 @@ def list_orders(
     if cursor is not None:
         try:
             start_id = int(cursor)
-        except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid cursor",
-            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid cursor")
 
         if not 0 <= start_id <= TOTAL_ORDERS:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid cursor",
-            )
+            raise HTTPException(status_code=400, detail="Invalid cursor")
 
     page = [
         item for item in catalog if item["id"] > start_id
