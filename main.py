@@ -1,11 +1,11 @@
 from collections import defaultdict, deque
-from time import monotonic
 from threading import Lock
+from time import monotonic
+from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 
 app = FastAPI(title="Q11 Orders API")
 
@@ -20,24 +20,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Fixed catalogue of 54 orders for pagination.
+# Fixed catalogue used by cursor pagination: IDs 1 through 54.
 catalog = [
     {"id": i, "product": f"Product {i}", "quantity": 1}
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
-idempotency_keys = {}
+# In-memory idempotency store.
+idempotency_keys: dict[str, dict[str, Any]] = {}
+next_order_id = 1
+order_lock = Lock()
+
+# Independent sliding-window rate-limit bucket per client.
 client_requests = defaultdict(deque)
 rate_limit_lock = Lock()
 
 
-class OrderRequest(BaseModel):
-    product: str = Field(min_length=1)
-    quantity: int = Field(gt=0)
-
-
 @app.middleware("http")
 async def per_client_rate_limit(request: Request, call_next):
+    # CORS preflight requests should not consume the client's quota.
     if request.method == "OPTIONS":
         return await call_next(request)
 
@@ -57,6 +58,7 @@ async def per_client_rate_limit(request: Request, call_next):
                     1,
                     int(WINDOW_SECONDS - (now - timestamps[0]) + 0.999),
                 )
+
                 return JSONResponse(
                     status_code=429,
                     content={"detail": "Rate limit exceeded"},
@@ -75,26 +77,37 @@ def home():
 
 @app.post("/orders", status_code=201)
 def create_order(
-    order: OrderRequest,
+    order: dict[str, Any],
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ):
+    global next_order_id
+
     if not idempotency_key.strip():
-        raise HTTPException(status_code=400, detail="Idempotency-Key cannot be empty")
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key cannot be empty",
+        )
 
-    if idempotency_key in idempotency_keys:
-        return idempotency_keys[idempotency_key]
+    with order_lock:
+        # Reuse the original result for repeated keys.
+        if idempotency_key in idempotency_keys:
+            return idempotency_keys[idempotency_key]
 
-    if len(idempotency_keys) >= TOTAL_ORDERS:
-        raise HTTPException(status_code=409, detail="Order catalogue is full")
+        if next_order_id > TOTAL_ORDERS:
+            raise HTTPException(
+                status_code=409,
+                detail="Order catalogue is full",
+            )
 
-    new_order = {
-        "id": len(idempotency_keys) + 1,
-        "product": order.product,
-        "quantity": order.quantity,
-    }
+        new_order = {
+            **order,
+            "id": next_order_id,
+        }
 
-    idempotency_keys[idempotency_key] = new_order
-    return new_order
+        idempotency_keys[idempotency_key] = new_order
+        next_order_id += 1
+
+        return new_order
 
 
 @app.get("/orders")
@@ -107,11 +120,17 @@ def list_orders(
     if cursor is not None:
         try:
             start_id = int(cursor)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid cursor")
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid cursor",
+            )
 
         if not 0 <= start_id <= TOTAL_ORDERS:
-            raise HTTPException(status_code=400, detail="Invalid cursor")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid cursor",
+            )
 
     page = [
         item for item in catalog if item["id"] > start_id
